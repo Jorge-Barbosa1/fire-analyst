@@ -1,6 +1,10 @@
-# FireAnalyst - SeverusPT
+# FireAnalyst · SeverusPT
 
-Wildfire analysis application for Portugal using Google Earth Engine, React, and Express.
+**▶ Live demo: [proj4-severuspt.onrender.com](https://proj4-severuspt.onrender.com)** *(free Render instance — the first load can take ~30 s to wake up)*
+
+A web app for analysing wildfires in Portugal. Draw an area on the map, pick a satellite and a date range, and FireAnalyst computes burn-severity maps and vegetation time series on Google Earth Engine. A RAG-powered chatbot answers questions about Portuguese wildfire data.
+
+**Stack:** React · TypeScript · Vite · Express · Google Earth Engine · Leaflet · Chart.js · OpenRouter LLMs · local embeddings (Xenova Transformers)
 
 ## 🚀 Features
 
@@ -42,7 +46,7 @@ GEE_PRIVATE_KEY='{"type":"service_account","project_id":"..."}'
 **Option B: JSON File (Development)**
 ```bash
 # Place your GEE service account JSON file at:
-# src/lib/config/severus-457615-83acf40ce029.json
+# src/lib/config/<your-service-account>.json
 
 # The app will automatically load it if GEE_PRIVATE_KEY is not set
 ```
@@ -174,7 +178,7 @@ NODE_ENV=production
 
 **GEE authentication failed?**
 - Verify credentials JSON is valid
-- Check file path: `src/lib/config/severus-*.json`
+- Check the file path: `src/lib/config/<your-service-account>.json`
 - Or set `GEE_PRIVATE_KEY` environment variable
 
 **Chat not working?**
