@@ -1,0 +1,3 @@
+[submodule "rag-vector-lab"]
+	path = rag-vector-lab
+	url = https://github.com/Jorge-Barbosa1/rag-vector-lab.git
