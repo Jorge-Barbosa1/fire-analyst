@@ -257,6 +257,10 @@ function Home() {
   const [firmsMessage, setFirmsMessage] = useState('');
   const [liveHotspotsCount, setLiveHotspotsCount] = useState<number>(0);
 
+  // GEE capability status
+  const [geeConfigured, setGeeConfigured] = useState<boolean | null>(null);
+  const [geeMessage, setGeeMessage] = useState('');
+
   // ANEPC / fogos.pt
   const [fogosLoading, setFogosLoading] = useState(false);
   const [fogosMessage, setFogosMessage] = useState('');
@@ -269,6 +273,12 @@ function Home() {
   const [baLoading, setBaLoading] = useState(false);
   const [baMessage, setBaMessage] = useState('');
   const [baMessageTone, setBaMessageTone] = useState<'ok' | 'warn' | 'info'>('info');
+
+  // Recent perimeter derived from a clicked fire point or drawn geometry
+  const [recentPerimeterLoading, setRecentPerimeterLoading] = useState(false);
+  const [recentPerimeterCount, setRecentPerimeterCount] = useState(0);
+  const [recentPerimeterMessage, setRecentPerimeterMessage] = useState('');
+  const [recentPerimeterTone, setRecentPerimeterTone] = useState<'ok' | 'warn' | 'info'>('info');
 
   // ICNF burned areas (official PT, validated, 1975-2025)
   const [icnfYears, setIcnfYears] = useState<string[]>([]);
@@ -423,6 +433,13 @@ function Home() {
   };
 
   const loadModisBurned = async () => {
+    if (!geeConfigured) {
+      setBaLoading(false);
+      setBaMessageTone('warn');
+      setBaMessage('MODIS MCD64A1 está desativado porque faltam credenciais GEE.');
+      return;
+    }
+
     setBaLoading(true);
     setBaMessageTone('info');
     setBaMessage('A vectorizar áreas ardidas MODIS (alguns segundos)...');
@@ -460,6 +477,79 @@ function Home() {
     setBaMessage('Áreas ardidas removidas.');
   };
 
+  const deriveRecentPerimeter = async () => {
+    if (!selectedGeometry) {
+      setRecentPerimeterTone('warn');
+      setRecentPerimeterMessage('Seleciona uma geometria ou clica num ponto de incêndio primeiro.');
+      return;
+    }
+
+    if (!fireDate) {
+      setRecentPerimeterTone('warn');
+      setRecentPerimeterMessage('Define a data do incêndio antes de derivar o perímetro.');
+      return;
+    }
+
+    setRecentPerimeterLoading(true);
+    setRecentPerimeterTone('info');
+    setRecentPerimeterMessage('A derivar perímetro recente com Sentinel-2 dNBR...');
+
+    try {
+      const res = await fetch('/api/gee/derive-perimeter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          geometry: selectedGeometry,
+          fireDate,
+          satellite: 'Sentinel-2/MSI',
+          preDays: 14,
+          postDays: 21,
+          bufferMeters: 3000,
+          burnThreshold: 0.12,
+          minAreaHa: 5,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setRecentPerimeterTone('warn');
+        setRecentPerimeterMessage(data.error || data.message || 'Falha a derivar o perímetro.');
+        return;
+      }
+
+      if (!data.geojson || data.count === 0) {
+        mapComponentRef.current?.removeBurnedAreaLayer('recent-perimeter');
+        setRecentPerimeterCount(0);
+        setRecentPerimeterTone('warn');
+        setRecentPerimeterMessage(data.note || 'Sem polígonos derivados nesta janela.');
+        return;
+      }
+
+      await mapComponentRef.current?.addBurnedAreaLayer('recent-perimeter', data.geojson, {
+        color: '#ea580c',
+        fillOpacity: 0.3,
+      });
+
+      setRecentPerimeterCount(data.count);
+      setRecentPerimeterTone('ok');
+      setRecentPerimeterMessage(
+        `${data.count} polígonos derivados por dNBR. Janela pré ${data.preWindow?.from ?? '—'} → ${data.preWindow?.to ?? '—'}, pós ${data.postWindow?.from ?? '—'} → ${data.postWindow?.to ?? '—'}.`,
+      );
+    } catch (err) {
+      console.error(err);
+      setRecentPerimeterTone('warn');
+      setRecentPerimeterMessage('Erro de rede ao derivar o perímetro recente.');
+    } finally {
+      setRecentPerimeterLoading(false);
+    }
+  };
+
+  const clearRecentPerimeter = () => {
+    mapComponentRef.current?.removeBurnedAreaLayer('recent-perimeter');
+    setRecentPerimeterCount(0);
+    setRecentPerimeterMessage('Perímetro recente removido.');
+  };
+
   const loadIcnfYears = async () => {
     try {
       const res = await fetch('/api/icnf/years');
@@ -467,6 +557,23 @@ function Home() {
       if (Array.isArray(data.years)) setIcnfYears(data.years);
     } catch (err) {
       console.error('ICNF years load error:', err);
+    }
+  };
+
+  const checkGeeStatus = async () => {
+    try {
+      const res = await fetch('/api/gee/status');
+      const data = await res.json();
+      setGeeConfigured(Boolean(data.configured));
+      setGeeMessage(
+        data.configured
+          ? 'GEE ligado e pronto.'
+          : 'GEE opcional desativado: adiciona GEE_PRIVATE_KEY ou o ficheiro de chave para ativar MODIS e análises Sentinel-2.',
+      );
+    } catch (err) {
+      console.error('GEE status load error:', err);
+      setGeeConfigured(false);
+      setGeeMessage('Não foi possível verificar o estado do GEE agora.');
     }
   };
 
@@ -522,6 +629,7 @@ function Home() {
   };
 
   useEffect(() => { checkFirmsStatus(); }, []);
+  useEffect(() => { checkGeeStatus(); }, []);
   useEffect(() => { loadIcnfYears(); }, []);
 
   const hasResults = timeSeries.length > 0 || severity.length > 0;
@@ -621,6 +729,27 @@ function Home() {
             {icnfMessage && <div style={dyn.note(icnfMessageTone)}>{icnfMessage}</div>}
           </div>
 
+          <div style={s.card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: space(1) }}>
+              <div style={s.cardTitle}>Perímetro recente (dNBR)</div>
+              <span style={{ fontSize: '0.7rem', color: color.textFaint }}>polígonos: {recentPerimeterCount}</span>
+            </div>
+            <div style={{ ...s.hint, marginBottom: space(3) }}>
+              Usa a geometria selecionada num ponto de fogo ou numa área desenhada para derivar um perímetro aproximado com Sentinel-2.
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: space(2), marginBottom: space(2) }}>
+              <button
+                onClick={deriveRecentPerimeter}
+                disabled={recentPerimeterLoading || !selectedGeometry || !fireDate}
+                style={touch(s.btnSecondary)}
+              >
+                Derivar
+              </button>
+              <button onClick={clearRecentPerimeter} style={touch(s.btnGhost)}>Limpar</button>
+            </div>
+            {recentPerimeterMessage && <div style={dyn.note(recentPerimeterTone)}>{recentPerimeterMessage}</div>}
+          </div>
+
           {/* 3. ANALYSIS — primary workflow */}
           <div style={s.sectionLabel}>Análise</div>
           <div style={s.cardAnalyst}>
@@ -710,7 +839,7 @@ function Home() {
               </div>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: space(2), marginBottom: space(2) }}>
-              <button onClick={loadModisBurned} disabled={baLoading} style={touch(s.btnSecondary)}>Mostrar</button>
+              <button onClick={loadModisBurned} disabled={baLoading || !geeConfigured} style={touch(s.btnSecondary)}>Mostrar</button>
               <button onClick={clearBurnedAreas} style={touch(s.btnGhost)}>Limpar</button>
             </div>
             {baMessage && <div style={dyn.note(baMessageTone)}>{baMessage}</div>}
@@ -728,6 +857,8 @@ function Home() {
             </div>
             {firmsMessage && <div style={dyn.note(firmsConfigured ? 'info' : 'warn')}>{firmsMessage}</div>}
           </div>
+
+          {geeMessage && <div style={dyn.note(geeConfigured ? 'info' : 'warn')}>{geeMessage}</div>}
         </aside>
 
         <main style={s.main}>

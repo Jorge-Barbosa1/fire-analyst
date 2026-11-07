@@ -205,6 +205,11 @@ const Map = forwardRef<MapHandle>((_props, ref) => {
           });
         },
         onEachFeature: (feature: any, layer: any) => {
+          layer.on('click', (e: any) => {
+            emitGeometry(layer);
+            L.DomEvent.stopPropagation(e);
+          });
+
           layer.bindPopup(popupBuilder(feature.properties ?? {}));
         },
       }).addTo(mapRef.current);

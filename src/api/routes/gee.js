@@ -1,4 +1,7 @@
 import express from 'express';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { getEE } from '../../lib/utils/gee-utils.js';
 import {
   getTimeSeriesData,
@@ -7,10 +10,65 @@ import {
 } from '../../lib/services/gee-service.js';
 
 const router = express.Router();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Default Portugal bounding box for burned-area queries
 const PT_BBOX = [-10.0, 36.8, -6.0, 42.3]; // [minLon, minLat, maxLon, maxLat]
 const MCD64A1_ASSET = 'MODIS/061/MCD64A1';
+const SENTINEL2_ASSET = 'COPERNICUS/S2_SR_HARMONIZED';
+
+const S2_BANDS = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12'];
+
+function shiftDateISO(isoDate, days) {
+  const date = new Date(`${isoDate}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function s2Mask(ee, img) {
+  const qa = img.select('QA60');
+  const cloud = 1 << 10;
+  const cirrus = 1 << 11;
+  const mask = qa.bitwiseAnd(cloud).eq(0).and(qa.bitwiseAnd(cirrus).eq(0));
+  return ee.Image(img).updateMask(mask);
+}
+
+function s2Rescale(ee, img) {
+  const refl = img.select(S2_BANDS).divide(1e4);
+  return ee.Image(img).addBands(refl, null, true);
+}
+
+function buildSentinel2NbrCollection(ee, region, startDate, endDate) {
+  return ee.ImageCollection(SENTINEL2_ASSET)
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .map((img) => {
+      const processed = s2Rescale(ee, s2Mask(ee, img));
+      return processed
+        .normalizedDifference(['B8', 'B12'])
+        .rename('NBR')
+        .copyProperties(img, ['system:time_start']);
+    })
+    .select('NBR');
+}
+
+function evaluate(obj) {
+  return new Promise((resolve, reject) => obj.evaluate((value, error) => (error ? reject(error) : resolve(value))));
+}
+
+function hasGeePrivateKeyFile() {
+  return fs.existsSync(path.join(__dirname, '../../lib/config/severus-457615-83acf40ce029.json'));
+}
+
+router.get('/status', (_req, res) => {
+  res.json({
+    configured: Boolean(process.env.GEE_PRIVATE_KEY) || hasGeePrivateKeyFile(),
+    privateKeyEnv: Boolean(process.env.GEE_PRIVATE_KEY),
+    privateKeyFile: hasGeePrivateKeyFile(),
+    note: 'MODIS burned-area analysis requires GEE credentials; Sentinel-2 time-series/severity also use GEE.',
+  });
+});
 
 // GET /api/gee/modis-burned-areas
 // Returns clickable GeoJSON polygons vectorised from MODIS MCD64A1 BurnDate
@@ -147,6 +205,153 @@ router.get('/modis-burned-areas', async (req, res) => {
     console.error('MCD64A1 fetch error:', err);
     res.status(500).json({
       error: 'MCD64A1_FETCH_FAILED',
+      message: err?.message || String(err),
+    });
+  }
+});
+
+// POST /api/gee/derive-perimeter
+// Derives an approximate recent burned perimeter from a click geometry or drawn AOI
+// using Sentinel-2 dNBR over a pre/post window around the supplied fire date.
+router.post('/derive-perimeter', async (req, res) => {
+  try {
+    const {
+      geometry,
+      fireDate,
+      satellite = 'Sentinel-2/MSI',
+      preDays = 14,
+      postDays = 21,
+      bufferMeters = 3000,
+      burnThreshold = 0.12,
+      minAreaHa = 5,
+    } = req.body || {};
+
+    if (!geometry || !fireDate) {
+      return res.status(400).json({
+        error: 'geometry and fireDate are required',
+      });
+    }
+
+    const normalizedSatellite = normalizeSatelliteLabel(String(satellite));
+    const ee = await getEE();
+    const regionBase = ee.Geometry(geometry);
+    const region = ['Point', 'MultiPoint'].includes(geometry?.type)
+      ? regionBase.buffer(Number(bufferMeters) || 3000)
+      : regionBase;
+
+    if (normalizedSatellite !== 'Sentinel2') {
+      return res.status(400).json({
+        error: 'Sentinel-2 is the only supported satellite for perimeter derivation at the moment',
+        fallback: 'Use Sentinel-2/MSI or draw a geometry for analysis',
+      });
+    }
+
+    const safePreDays = Math.max(1, Number(preDays) || 14);
+    const safePostDays = Math.max(1, Number(postDays) || 21);
+    const safeThreshold = Number(burnThreshold);
+    const safeMinAreaHa = Math.max(0, Number(minAreaHa) || 5);
+
+    const preStart = shiftDateISO(fireDate, -safePreDays);
+    const preEnd = shiftDateISO(fireDate, -1);
+    const postStart = shiftDateISO(fireDate, 0);
+    const postEnd = shiftDateISO(fireDate, safePostDays);
+
+    const preCol = buildSentinel2NbrCollection(ee, region, preStart, preEnd);
+    const postCol = buildSentinel2NbrCollection(ee, region, postStart, postEnd);
+
+    const [preCount, postCount] = await Promise.all([
+      evaluate(preCol.size()),
+      evaluate(postCol.size()),
+    ]);
+
+    if (!preCount || !postCount) {
+      return res.status(200).json({
+        source: 'Sentinel-2/dNBR',
+        satellite: normalizedSatellite,
+        fireDate,
+        preWindow: { from: preStart, to: preEnd },
+        postWindow: { from: postStart, to: postEnd },
+        preImageCount: preCount || 0,
+        postImageCount: postCount || 0,
+        threshold: safeThreshold,
+        count: 0,
+        geojson: { type: 'FeatureCollection', features: [] },
+        note: 'Não há imagens Sentinel-2 suficientes nesta janela para derivar um perímetro.',
+      });
+    }
+
+    const pre = preCol.median();
+    const post = postCol.median();
+    const dnbr = pre.subtract(post).rename('dNBR');
+    const burnMask = dnbr.gte(safeThreshold).selfMask().rename('burned');
+
+    const vectors = burnMask.reduceToVectors({
+      geometry: region,
+      scale: 20,
+      geometryType: 'polygon',
+      eightConnected: true,
+      labelProperty: 'burned',
+      maxPixels: 1e10,
+    });
+
+    const enriched = vectors
+      .map((f) => {
+        const areaHa = f.geometry().area(1).divide(10000);
+        return f.set({
+          source_dataset: 'Sentinel-2/dNBR',
+          fire_date: fireDate,
+          pre_start: preStart,
+          pre_end: preEnd,
+          post_start: postStart,
+          post_end: postEnd,
+          area_ha: areaHa,
+          threshold: safeThreshold,
+        });
+      })
+      .filter(ee.Filter.gte('area_ha', safeMinAreaHa));
+
+    const raw = await evaluate(enriched);
+    const features = (raw?.features || []).map((f) => {
+      const p = f.properties || {};
+      return {
+        type: 'Feature',
+        geometry: f.geometry,
+        properties: {
+          source_dataset: p.source_dataset || 'Sentinel-2/dNBR',
+          fire_date: p.fire_date || fireDate,
+          pre_start: p.pre_start || preStart,
+          pre_end: p.pre_end || preEnd,
+          post_start: p.post_start || postStart,
+          post_end: p.post_end || postEnd,
+          area_ha: typeof p.area_ha === 'number' ? Math.round(p.area_ha) : null,
+          threshold: typeof p.threshold === 'number' ? p.threshold : safeThreshold,
+        },
+      };
+    });
+
+    const totalHa = features.reduce((sum, feature) => sum + (feature.properties.area_ha || 0), 0);
+
+    return res.json({
+      source: 'Sentinel-2/dNBR',
+      satellite: normalizedSatellite,
+      fireDate,
+      preWindow: { from: preStart, to: preEnd },
+      postWindow: { from: postStart, to: postEnd },
+      preImageCount: preCount,
+      postImageCount: postCount,
+      threshold: safeThreshold,
+      minAreaHa: safeMinAreaHa,
+      count: features.length,
+      totalBurnedHa: totalHa,
+      geojson: { type: 'FeatureCollection', features },
+      note: features.length === 0
+        ? 'Não foram encontrados polígonos acima do limiar nesta janela.'
+        : undefined,
+    });
+  } catch (err) {
+    console.error('derive-perimeter error:', err);
+    return res.status(500).json({
+      error: 'DERIVE_PERIMETER_FAILED',
       message: err?.message || String(err),
     });
   }
