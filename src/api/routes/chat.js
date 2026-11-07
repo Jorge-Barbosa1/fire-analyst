@@ -1,6 +1,4 @@
 import express from 'express';
-import { getEmbeddedDocuments } from '../../lib/rag/database.js';
-import { searchSimilarDocuments } from '../../lib/rag/embeddings.js';
 
 const router = express.Router();
 
@@ -14,31 +12,27 @@ const openaiConfig = {
   }
 };
 
-// Enhanced RAG search function
+// RAG search via rag-vector-lab (Python service, ver services/ragvl_server.py)
+const RAGVL_URL = process.env.RAGVL_URL || 'http://127.0.0.1:8765';
+
 async function performEnhancedRAGSearch(query) {
-  const docs = await getEmbeddedDocuments();
-  
-  if (!docs || docs.length === 0) {
-    return { context: "", results: [] };
+  const res = await fetch(`${RAGVL_URL}/search`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, k: 5 }),
+  });
+  if (!res.ok) throw new Error(`ragvl service error: ${res.status}`);
+  const { results } = await res.json();
+
+  if (!results || results.length === 0) {
+    return { context: '', results: [] };
   }
 
-  // Search with multiple attempts
-  const searchResults = await searchSimilarDocuments(
-    query,
-    docs,
-    { topK: 5, minScore: 0.3 }
-  );
-
-  if (!searchResults || searchResults.length === 0) {
-    return { context: "", results: [] };
-  }
-
-  // Build context from results
-  const context = searchResults
-    .map((r, i) => `[${i + 1}] ${r.content}`)
+  const context = results
+    .map((r, i) => `[${i + 1}] (${r.source}) ${r.text}`)
     .join('\n\n');
 
-  return { context, results: searchResults };
+  return { context, results: results.map((r) => ({ content: r.text, score: r.score, source: r.source })) };
 }
 
 router.post('/', async (req, res) => {
@@ -74,7 +68,7 @@ router.post('/', async (req, res) => {
     // System prompt
     const systemPrompt = `Você é o SeverusBot, um assistente especializado em incêndios florestais em Portugal. ${
       context
-        ? `Use o seguinte contexto para responder:\n\n${context}\n\nResponda com base neste contexto.`
+        ? `Use o seguinte contexto (excertos de relatórios do ICNF) para responder:\n\n${context}\n\nRegras: use apenas números que estejam no contexto, sem os alterar nem misturar anos diferentes; indique de que relatório/ano e período vêm os dados; se o contexto não responder à pergunta, diga-o em vez de inventar.`
         : "Responda com base no seu conhecimento geral sobre incêndios florestais."
     }`;
 
@@ -93,7 +87,7 @@ router.post('/', async (req, res) => {
         ...openaiConfig.defaultHeaders
       },
       body: JSON.stringify({
-        model: "meta-llama/llama-3.1-8b-instruct:free",
+        model: process.env.OPENROUTER_MODEL || "openrouter/free",
         messages: apiMessages,
         temperature: 0.7,
         max_tokens: 1000
@@ -108,6 +102,7 @@ router.post('/', async (req, res) => {
     const assistantMessage = data.choices[0]?.message?.content || "Desculpe, não consegui gerar uma resposta.";
 
     res.json({
+      reply: assistantMessage, // campo lido pelo ChatWidget
       message: assistantMessage,
       ragStatus,
       sourcesUsed: searchResults.length,
