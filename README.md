@@ -6,6 +6,19 @@ A web app for analysing wildfires in Portugal. Draw an area on the map, pick a s
 
 **Stack:** React · TypeScript · Vite · Express · Google Earth Engine · Leaflet · Chart.js · OpenRouter LLMs · FAISS retrieval (`rag-vector-lab`)
 
+## 📸 Screenshots
+
+**SeverusBot** answering from the ICNF reports (retrieval by `rag-vector-lab`):
+
+![SeverusBot answering a question about 2021 wildfires](docs/images/chat-answer.png)
+
+<details>
+<summary>Chat welcome screen with suggested questions</summary>
+
+![SeverusBot welcome screen](docs/images/chat-welcome.png)
+
+</details>
+
 ## 🚀 Features
 
 - **Interactive Map**: Draw polygons/rectangles to select areas of interest
